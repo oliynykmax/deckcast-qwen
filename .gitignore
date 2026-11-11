@@ -1,0 +1,5 @@
+out/
+deckcast
+*.o
+*.ll
+*.bct2
