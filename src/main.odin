@@ -2,8 +2,8 @@ package main
 
 // deckcast: compile a PowerPoint Recorder deck (.pptx with one narration
 // clip per slide) into a finished MP4. Odin owns the package parsing, deck
-// cleaning, masking, scheduling and timing; ffmpeg/LibreOffice/pdftoppm do
-// the rendering and encoding. See README.md.
+// cleaning, masking, static-background compositing, scheduling and timing;
+// ffmpeg/LibreOffice/pdftoppm/x264 do rendering and encoding. See README.md.
 
 import "core:fmt"
 import "core:math"
@@ -13,19 +13,19 @@ import "core:strings"
 import "core:time"
 
 Options :: struct {
-	input:        string,
-	output:       string,
-	pdf:          string,
-	speed:        f64,
-	gain:         string,
-	target:       f64,
-	work:         string,
-	slides_lo:    int,
-	slides_hi:    int,
-	encoder:      string,
-	jobs:         int,
-	vaapi_device: string,
-	check:        bool,
+	input:   string,
+	output:  string,
+	pdf:     string,
+	speed:   f64,
+	gain:    string,
+	target:  f64,
+	work:    string,
+	slides_lo: int,
+	slides_hi: int,
+	jobs:    int,
+	fps:     int,
+	check:   bool,
+	cpu_decode: bool,
 }
 
 Stage_Time :: struct {
@@ -47,9 +47,11 @@ Options:
       --target F         auto-gain target LUFS (default -18)
       --work DIR         work directory (kept; default /tmp/deckcast-<pid>)
       --slides LO-HI     only compile this slide range (quick tests)
-      --encoder E        auto | vaapi | x264 (default auto)
-      --jobs N           parallel encode jobs (default 3 vaapi / 4 x264)
-      --vaapi-device P   render node (default: first /dev/dri/renderD*)
+      --fps N            output frame rate (default 30, the source rate; every
+                         webcam frame is preserved)
+      --jobs N           parallel x264 encoders (default 2)
+      --cpu-decode       force CPU webcam decode (GPU/VAAPI decode is auto-used
+                         when available; it frees CPU for compositing/encoding)
       --check            measure loudness of the finished file too
 `)
 	os.exit(2)
@@ -69,7 +71,7 @@ stage_record :: proc(stages: ^[dynamic]Stage_Time, name: string, start: time.Tim
 }
 
 parse_args :: proc() -> Options {
-	o := Options{speed = 1.0, gain = "auto", target = -18.0, encoder = "auto"}
+	o := Options{speed = 1.0, gain = "auto", target = -18.0, fps = FPS_DEFAULT}
 	args := os.args
 	i := 1
 	for ; i < len(args); i += 1 {
@@ -115,8 +117,13 @@ parse_args :: proc() -> Options {
 				}
 				o.slides_lo, o.slides_hi = n, n
 			}
-		case "--encoder":
-			o.encoder = arg_value(args, &i, a)
+		case "--fps":
+			n, ok := strconv.parse_int(arg_value(args, &i, a), 10)
+			if !ok || n < 1 || n > 60 {
+				fmt.eprintf("deckcast: bad --fps\n")
+				usage()
+			}
+			o.fps = n
 		case "--jobs":
 			n, ok := strconv.parse_int(arg_value(args, &i, a), 10)
 			if !ok || n < 1 {
@@ -124,10 +131,10 @@ parse_args :: proc() -> Options {
 				usage()
 			}
 			o.jobs = n
-		case "--vaapi-device":
-			o.vaapi_device = arg_value(args, &i, a)
 		case "--check":
 			o.check = true
+		case "--cpu-decode":
+			o.cpu_decode = true
 		case "-h", "--help":
 			usage()
 		case:
@@ -146,16 +153,6 @@ parse_args :: proc() -> Options {
 		usage()
 	}
 	return o
-}
-
-find_vaapi_device :: proc() -> string {
-	for n in 128 ..< 136 {
-		p := hprintf("/dev/dri/renderD%d", n)
-		if os.exists(p) {
-			return p
-		}
-	}
-	return ""
 }
 
 abs_path :: proc(path: string) -> string {
@@ -198,6 +195,16 @@ main :: proc() {
 			os.exit(1)
 		}
 	}
+	// Raw composite frames live on tmpfs so the encoder reads them from RAM.
+	shm := hprintf("/dev/shm/deckcast-%d", os.get_pid())
+	if !os.exists("/dev/shm") {
+		shm = hprintf("%s/shm", o.work)
+	}
+	if err := os.make_directory_all(shm); err != nil {
+		fmt.eprintf("deckcast: cannot create tmpfs dir: %v\n", err)
+		os.exit(1)
+	}
+	defer os.remove_all(shm)
 
 	// --- open package, parse slides ---
 	t := time.now()
@@ -211,7 +218,6 @@ main :: proc() {
 	}
 	page_count := len(cleaned)
 
-	// Slide range selection.
 	lo, hi := 1, page_count
 	if o.slides_lo > 0 {
 		lo, hi = o.slides_lo, o.slides_hi
@@ -259,6 +265,21 @@ main :: proc() {
 	}
 	stage_record(&stages, "extract", t)
 
+	// --- loudness measurement in the background (overlaps everything below) ---
+	audio_list := hprintf("%s/audio.txt", o.work)
+	{
+		b := strings.builder_make()
+		for &s in slides {
+			strings.write_string(&b, hprintf("file '%s'\n", s.video_path))
+		}
+		write_text(audio_list, strings.to_string(b))
+	}
+	loud_job := job_make("loudness", o.work, loudness_cmd(audio_list))
+	loud_proc, loud_ok := job_start_bg(&loud_job)
+	if !loud_ok {
+		os.exit(1)
+	}
+
 	// --- clean deck for LibreOffice: no video shapes, no timing, no media ---
 	t = time.now()
 	wentries: [dynamic]Zip_Write_Entry
@@ -274,8 +295,6 @@ main :: proc() {
 		if !dok {
 			os.exit(1)
 		}
-		// Stored data aliases the archive (alive until exit); inflated
-		// data is heap-owned. Both stay valid until the zip is written.
 		_ = alloc
 		append(&wentries, Zip_Write_Entry{e.name, data})
 	}
@@ -285,75 +304,27 @@ main :: proc() {
 	}
 	stage_record(&stages, "clean", t)
 
-	// --- encoder choice ---
-	use_vaapi := false
-	vaapi_device := o.vaapi_device
-	switch o.encoder {
-	case "vaapi":
-		use_vaapi = true
-	case "x264":
-		use_vaapi = false
-	case "auto":
-		if vaapi_device == "" {
-			vaapi_device = find_vaapi_device()
-		}
-		if vaapi_device != "" {
-			test := job_make("vaapi-test", o.work, vaapi_test_cmd(vaapi_device))
-			use_vaapi = run_batch([]Job{test}, 1)
-		}
-	case:
-		fmt.eprintf("deckcast: unknown encoder %s\n", o.encoder)
-		os.exit(1)
-	}
-	if use_vaapi && vaapi_device == "" {
-		vaapi_device = find_vaapi_device()
-	}
 	enc_jobs := o.jobs
 	if enc_jobs == 0 {
-		enc_jobs = 3 if use_vaapi else 4
+		enc_jobs = 2
+	}
+	threads := 4
+	vaapi_device := find_vaapi_device() if !o.cpu_decode else "" // GPU decode frees CPU
+
+	// --- LibreOffice render in the background (overlaps probing) ---
+	soffice_job := job_make("soffice", o.work, soffice_cmd(clean_pptx, o.work))
+	soffice_proc, soffice_ok := job_start_bg(&soffice_job)
+	if !soffice_ok {
+		os.exit(1)
 	}
 
-	// --- parallel: PDF render, loudness probe, per-clip frame counts ---
+	// --- per-clip frame counts (fast) ---
 	t = time.now()
-	audio_list := hprintf("%s/audio.txt", o.work)
-	{
-		b := strings.builder_make()
-		for &s in slides {
-			strings.write_string(&b, hprintf("file '%s'\n", s.video_path))
-		}
-		write_text(audio_list, strings.to_string(b))
-	}
-
 	batch: [dynamic]Job
-	append(&batch, job_make("soffice", o.work, soffice_cmd(clean_pptx, o.work)))
-	append(&batch, job_make("loudness", o.work, loudness_cmd(audio_list)))
 	for &s in slides {
 		append(&batch, job_make(hprintf("probe-%02d", s.number), o.work, probe_cmd(s.video_path)))
 	}
 	must_batch(batch[:], 8)
-
-	pdf := hprintf("%s/clean.pdf", o.work)
-	if !os.exists(pdf) {
-		fmt.eprintf("deckcast: LibreOffice did not produce %s\n", pdf)
-		os.exit(1)
-	}
-
-	gain_db: f64
-	if o.gain == "auto" {
-		lufs, ok := parse_lufs(read_log(hprintf("%s/logs/loudness.err", o.work)))
-		if !ok {
-			fmt.eprintf("deckcast: cannot measure loudness (see logs/loudness.err)\n")
-			os.exit(1)
-		}
-		gain_db = math.round((o.target-lufs)*10) / 10
-	} else {
-		v, ok := strconv.parse_f64(o.gain)
-		if !ok {
-			fmt.eprintf("deckcast: bad --gain %s\n", o.gain)
-			os.exit(1)
-		}
-		gain_db = v
-	}
 
 	for &s in slides {
 		log := read_log(hprintf("%s/logs/probe-%02d.out", o.work, s.number))
@@ -363,16 +334,49 @@ main :: proc() {
 			os.exit(1)
 		}
 		s.src_w, s.src_h, s.src_frames = w, h, frames
-		s.out_frames = int(math.round(f64(frames) / o.speed))
-		s.dur = f64(s.out_frames) / FPS
+		s.out_frames = int(math.round(f64(frames) * f64(o.fps) / (f64(SRC_FPS) * o.speed)))
+		s.dur = f64(s.out_frames) / f64(o.fps)
 	}
-	stage_record(&stages, "render+probe", t)
+	stage_record(&stages, "probe", t)
+
+	// --- webcam decode: pre-start the first decoders so they overlap rendering ---
+	cam_procs := make([]os.Process, len(slides))
+	cam_jarr := make([]Job, len(slides))
+	cam_state := make([]int, len(slides))
+	prestart := CAM_PAR
+	if prestart > len(slides) {
+		prestart = len(slides)
+	}
+	for i in 0 ..< prestart {
+		s := &slides[i]
+		cam := hprintf("%s/cam_%02d.yuv", shm, s.number)
+		cam_jarr[i] = job_make(hprintf("cam-%02d", s.number), o.work, webcam_raw_cmd(s.video_path, cam, s, o.speed, o.fps, vaapi_device))
+		p, cok := job_start_bg(&cam_jarr[i])
+		if !cok {
+			os.exit(1)
+		}
+		cam_procs[i] = p
+		cam_state[i] = CAM_RUNNING
+	}
+
+	// --- finish LibreOffice render ---
+	t = time.now()
+	job_wait_bg(soffice_proc, &soffice_job)
+	if !soffice_job.ok {
+		os.exit(1)
+	}
+	pdf := hprintf("%s/clean.pdf", o.work)
+	if !os.exists(pdf) {
+		fmt.eprintf("deckcast: LibreOffice did not produce %s\n", pdf)
+		os.exit(1)
+	}
+	stage_record(&stages, "render", t)
 
 	// --- rasterize PDF pages (parallel chunks) ---
 	t = time.now()
 	png_prefix := hprintf("%s/png/s", o.work)
 	{
-		chunks := 4
+		chunks := 8
 		ppm_jobs: [dynamic]Job
 		for c in 0 ..< chunks {
 			cl := page_count*c/chunks + 1
@@ -386,7 +390,7 @@ main :: proc() {
 	}
 	stage_record(&stages, "rasterize", t)
 
-	// --- slide PNGs -> raw YUV (once per slide, not per frame) ---
+	// --- slide PNGs -> raw YUV (once per slide) ---
 	t = time.now()
 	digits := len(hprintf("%d", page_count))
 	yuv_jobs: [dynamic]Job
@@ -402,9 +406,6 @@ main :: proc() {
 	t = time.now()
 	mask_paths := make(map[[2]int]string)
 	for &s in slides {
-		if !s.ellipse {
-			continue
-		}
 		key := [2]int{s.w, s.h}
 		if _, seen := mask_paths[key]; seen {
 			continue
@@ -420,41 +421,67 @@ main :: proc() {
 	}
 	stage_record(&stages, "masks", t)
 
-	// --- encode segments ---
+	// --- composite + encode (pipelined, chunked to bound tmpfs use) ---
 	t = time.now()
-	seg_jobs: [dynamic]Job
 	for &s in slides {
-		out := hprintf("%s/seg/%02d.mkv", o.work, s.number)
-		params := Segment_Params{
-			slide_png_yuv = hprintf("%s/yuv/%02d.yuv", o.work, s.number),
-			video = s.video_path,
-			mask_raw = mask_paths[[2]int{s.w, s.h}],
-			out = out,
-			s = &s,
-			speed = o.speed,
-			gain_db = gain_db,
-			vaapi = use_vaapi,
-			vaapi_device = vaapi_device,
-		}
-		append(&seg_jobs, job_make(hprintf("seg-%02d", s.number), o.work, segment_cmd(params)))
-		fmt.eprintf("slide %d: %.1f s (%d frames)\n", s.number, s.dur, s.out_frames)
+		fmt.eprintf("slide %d: %.1f s (%d frames @ %d fps)\n", s.number, s.dur, s.out_frames, o.fps)
 	}
-	must_batch(seg_jobs[:], enc_jobs)
+	chunks := build_chunks(slides[:])
+	defer delete(chunks)
+	audio_out := hprintf("%s/audio.m4a", o.work)
+	ac := Audio_Ctl{
+		loud_proc = loud_proc, loud_job = loud_job,
+		work = o.work, speed = o.speed, target = o.target, gain_mode = o.gain,
+		slides = slides[:], audio_out = audio_out,
+	}
+	if !encode_pipeline(slides[:], chunks, o.work, shm, o.fps, enc_jobs, threads, o.speed, vaapi_device, mask_paths, cam_procs, cam_jarr, cam_state, &ac) {
+		os.exit(1)
+	}
+	delete(cam_procs)
+	delete(cam_jarr)
+	delete(cam_state)
 	stage_record(&stages, "encode", t)
 
-	// --- concatenate + AAC + faststart ---
+	// --- wait for the audio pass (started during encode once loudness was ready) ---
+	t = time.now()
+	if !ac.started {
+		fmt.eprintf("deckcast: audio pass was not started (loudness failed?)\n")
+		os.exit(1)
+	}
+	job_wait_bg(ac.audio_proc, &ac.audio_job)
+	if !ac.audio_job.ok {
+		os.exit(1)
+	}
+	gain_db := ac.gain_db
+	stage_record(&stages, "audio", t)
+
+	// --- wrap raw H.264 segments into Matroska (parallel, stream copy) ---
+	t = time.now()
+	wrap_jobs: [dynamic]Job
+	for &c in chunks {
+		in264 := hprintf("%s/seg/%04d.264", o.work, c.id)
+		outmkv := hprintf("%s/seg/%04d.mkv", o.work, c.id)
+		append(&wrap_jobs, job_make(hprintf("wrap-%04d", c.id), o.work, wrap_cmd(in264, outmkv, o.fps)))
+	}
+	must_batch(wrap_jobs[:], 8)
+	for &c in chunks {
+		os.remove(hprintf("%s/seg/%04d.264", o.work, c.id))
+	}
+	stage_record(&stages, "wrap", t)
+
+	// --- concatenate + faststart (audio already finished) ---
 	t = time.now()
 	seg_list := hprintf("%s/segments.txt", o.work)
 	{
 		b := strings.builder_make()
-		for &s in slides {
-			strings.write_string(&b, hprintf("file '%s/seg/%02d.mkv'\n", o.work, s.number))
+		for &c in chunks {
+			strings.write_string(&b, hprintf("file '%s/seg/%04d.mkv'\n", o.work, c.id))
 		}
 		write_text(seg_list, strings.to_string(b))
 	}
 	out_abs := abs_path(o.output)
 	os.make_directory_all(os.dir(out_abs))
-	must_batch([]Job{job_make("concat", o.work, concat_cmd(seg_list, out_abs))}, 1)
+	must_batch([]Job{job_make("mux", o.work, mux_cmd(seg_list, audio_out, out_abs))}, 1)
 	stage_record(&stages, "mux", t)
 
 	// --- PDF deliverable ---
@@ -474,8 +501,8 @@ main :: proc() {
 	dur_str := strings.trim_space(read_log(djob.stdout_path))
 	out_dur, _ := strconv.parse_f64(dur_str)
 
-	fmt.printf("%s: %d:%04.1f, gain %+.1f dB, encoder %s\n",
-		out_abs, int(out_dur) / 60, math.mod(out_dur, 60), gain_db, "vaapi" if use_vaapi else "x264")
+	fmt.printf("%s: %d:%04.1f, gain %+.1f dB, %d fps, x264\n",
+		out_abs, int(out_dur) / 60, math.mod(out_dur, 60), gain_db, o.fps)
 	if o.check {
 		cjob := job_make("check-loudness", o.work, loudness_file_cmd(out_abs))
 		run_batch([]Job{cjob}, 1)

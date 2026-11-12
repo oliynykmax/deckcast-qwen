@@ -1,15 +1,22 @@
 package main
 
-// ffmpeg/ffprobe/LibreOffice command builders and output parsers.
-// The heavy pixel work (decode, crop, scale, circle mask, overlay, encode)
-// stays in ffmpeg; with VAAPI the overlay and encode run on the GPU and the
-// static slide is uploaded exactly once per segment.
+// ffmpeg/ffprobe/LibreOffice/x264 command builders and output parsers.
+//
+// Speed strategy: a slide's background is static, only the small webcam circle
+// moves. We composite in Odin (rewriting just the webcam rect) into a raw frame
+// file on tmpfs, then let x264 read that file. ~95% of each frame's macroblocks
+// are bit-identical to the previous frame, so x264 emits cheap P-skips: it
+// effectively encodes only the pixels that change. The output stays at the
+// source rate (30 fps, every webcam frame preserved); throughput comes from
+// running several x264 encoders in parallel over fixed-size chunks.
 
 import "core:fmt"
+import "core:os"
 import "core:strconv"
 import "core:strings"
 
-FPS :: 30
+FPS_DEFAULT :: 30
+SRC_FPS :: 30
 
 probe_cmd :: proc(path: string) -> []string {
 	return cmd_of(
@@ -105,89 +112,124 @@ atempo_chain :: proc(speed: f64) -> string {
 	return strings.to_string(b)
 }
 
-Segment_Params :: struct {
-	slide_png_yuv: string, // raw yuv420p 1920x1080, single frame
-	video:         string,
-	mask_raw:      string, // raw gray w*h, single frame ("" when no ellipse)
-	out:           string,
-	s:             ^Slide,
-	speed:         f64,
-	gain_db:       f64,
-	vaapi:         bool,
-	vaapi_device:  string,
-}
-
-segment_cmd :: proc(p: Segment_Params) -> []string {
-	s := p.s
+// webcam_raw_cmd decodes a slide's recording, speeds it up, resamples to the
+// output frame rate, crops/scales to the webcam rect and writes raw yuv420p
+// frames (no alpha — the circle mask is applied during compositing). With a
+// VAAPI device the decode+scale run on the GPU, which keeps the CPU free for
+// the encoder; the crop is done after downloading the aspect-scaled frame.
+webcam_raw_cmd :: proc(video, out: string, s: ^Slide, speed: f64, fps: int, vaapi_device: string) -> []string {
 	cw := int(f64(s.src_w)*(1-s.crop_l-s.crop_r) + 0.5)
 	cx := int(f64(s.src_w)*s.crop_l + 0.5)
+	if vaapi_device != "" {
+		sw := int(f64(s.src_w)*f64(s.h)/f64(s.src_h) + 0.5)
+		cx2 := int(f64(cx)*f64(s.h)/f64(s.src_h) + 0.5)
+		vf := hprintf("setpts=PTS/%f,fps=%d,scale_vaapi=w=%d:h=%d,hwdownload,format=nv12,crop=%d:%d:%d:0,format=yuv420p",
+			speed, fps, sw, s.h, s.w, s.h, cx2)
+		return cmd_of(
+			"ffmpeg", "-nostdin", "-y", "-v", "error",
+			"-hwaccel", "vaapi", "-hwaccel_device", vaapi_device, "-hwaccel_output_format", "vaapi",
+			"-i", video, "-vf", vf, "-frames:v", hprintf("%d", s.out_frames),
+			"-an", "-f", "rawvideo", "-pix_fmt", "yuv420p", out,
+		)
+	}
+	vf := hprintf("setpts=PTS/%f,fps=%d,crop=%d:%d:%d:0,scale=%d:%d,format=yuv420p",
+		speed, fps, cw, s.src_h, cx, s.w, s.h)
+	return cmd_of(
+		"ffmpeg", "-nostdin", "-y", "-v", "error", "-threads", "2", "-i", video,
+		"-vf", vf, "-frames:v", hprintf("%d", s.out_frames),
+		"-an", "-f", "rawvideo", "-pix_fmt", "yuv420p", out,
+	)
+}
 
-	cam := hprintf("[1:v]fps=%d,crop=%d:%d:%d:0,scale=%d:%d,setpts=PTS/%f,format=yuva420p[cam]",
-		FPS, cw, s.src_h, cx, s.w, s.h, p.speed)
-
-	mask_fc := ""
-	if s.ellipse {
-		if p.vaapi {
-			mask_fc = ";[2:v]loop=loop=-1:size=1[m];[cam][m]alphamerge[c];[c]hwupload[camhw]"
-		} else {
-			mask_fc = ";[2:v]loop=loop=-1:size=1[m];[cam][m]alphamerge[c]"
-		}
-	} else {
-		if p.vaapi {
-			mask_fc = ";[cam]hwupload[camhw]"
-		} else {
-			mask_fc = ";[cam]null[c]"
+// find_vaapi_device returns the first DRM render node, or "" if none.
+find_vaapi_device :: proc() -> string {
+	for n in 128 ..< 136 {
+		p := hprintf("/dev/dri/renderD%d", n)
+		if os.exists(p) {
+			return p
 		}
 	}
+	return ""
+}
 
-	audio := hprintf("[1:a]%svolume=%.1fdB,alimiter=limit=0.89:level=false,aresample=48000,apad,atrim=0:%f,aformat=channel_layouts=mono[a]",
-		atempo_chain(p.speed), p.gain_db, s.dur)
+// x264_cmd encodes a raw YUV frame file with the x264 CLI (faster than ffmpeg's
+// libx264 wrapper for this read-bound, mostly-static content). w/h select the
+// strip (1920xSH) or the static bg_top (1920xstrip_top_y). --stitchable keeps
+// SPS/PPS identical across encodes so h264.odin can splice them.
+x264_cmd :: proc(raw_in, out_264: string, fps, threads, w, h: int) -> []string {
+	return cmd_of(
+		"x264", "--preset", "ultrafast", "--crf", "18",
+		"--threads", hprintf("%d", threads),
+		"--fps", hprintf("%d", fps), "--input-res", hprintf("%dx%d", w, h),
+		"--keyint", "9999", "--scenecut", "0", "--stitchable",
+		"-o", out_264, raw_in,
+	)
+}
 
-	fc: string
-	vcodec: []string
-	if p.vaapi {
-		fc = hprintf("[0:v]format=nv12,hwupload,loop=loop=-1:size=1[bg];%s%s;[bg][camhw]overlay_vaapi=x=%d:y=%d[v];%s",
-			cam, mask_fc, s.x, s.y, audio)
-		vcodec = {"-c:v", "h264_vaapi", "-qp", "19", "-bf", "0", "-refs", "1", "-async_depth", "8", "-g", "300"}
-	} else {
-		fc = hprintf("[0:v]loop=loop=-1:size=1[bg];%s%s;[bg][c]overlay=%d:%d,format=yuv420p[v];%s",
-			cam, mask_fc, s.x, s.y, audio)
-		vcodec = {"-c:v", "libx264", "-preset", "veryfast", "-crf", "18"}
+// write_bgtop extracts the static rows above the strip (0..bgtop_h-1) from a
+// slide's full YUV into a one-frame raw file for the bg_top I-slice encode.
+write_bgtop :: proc(yuv_path, out_path: string, bgtop_h: int) -> bool {
+	data, err := os.read_entire_file(yuv_path, context.allocator)
+	if err != nil {
+		fmt.eprintf("deckcast: bgtop: read %s: %v\n", yuv_path, err)
+		return false
 	}
+	defer delete(data)
+	out: [dynamic]byte
+	defer delete(out)
+	append(&out, ..data[:bgtop_h*BG_W])
+	u := BG_W * BG_H
+	append(&out, ..data[u:u+(bgtop_h/2)*(BG_W/2)])
+	v := BG_W*BG_H + BG_W*BG_H/4
+	append(&out, ..data[v:v+(bgtop_h/2)*(BG_W/2)])
+	return os.write_entire_file(out_path, out[:]) == nil
+}
 
+// wrap_cmd wraps a raw H.264 segment into Matroska at the right frame rate so
+// the concat demuxer can stitch segments with correct timestamps.
+wrap_cmd :: proc(in_264, out_mkv: string, fps: int) -> []string {
+	return cmd_of(
+		"ffmpeg", "-nostdin", "-y", "-v", "error",
+		"-r", hprintf("%d", fps), "-i", in_264, "-c", "copy", out_mkv,
+	)
+}
+
+// audio_pass_cmd renders the whole narration in one pass: per-clip speed +
+// exact trim, concat, gain, limiter, 48 kHz mono AAC. Runs concurrently with
+// the video encode so its cost is hidden.
+audio_pass_cmd :: proc(slides: []Slide, out: string, speed, gain_db: f64) -> []string {
 	cmd: [dynamic]string
 	append(&cmd, "ffmpeg", "-nostdin", "-y", "-v", "error")
-	if p.vaapi {
-		append(&cmd, "-vaapi_device", p.vaapi_device)
+	for &s in slides {
+		append(&cmd, "-i", s.video_path)
 	}
-	append(&cmd, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "1920x1080", "-framerate", hprintf("%d", FPS), "-i", p.slide_png_yuv)
-	append(&cmd, "-i", p.video)
-	if s.ellipse {
-		append(&cmd, "-f", "rawvideo", "-pix_fmt", "gray", "-s", hprintf("%dx%d", s.w, s.h), "-framerate", hprintf("%d", FPS), "-i", p.mask_raw)
+	b := strings.builder_make()
+	for i in 0 ..< len(slides) {
+		s := &slides[i]
+		strings.write_string(&b, hprintf("[%d:a]%satrim=0:%f,asetpts=PTS-STARTPTS[a%d];",
+			i, atempo_chain(speed), s.dur, i))
 	}
-	append(&cmd, "-filter_complex", fc, "-map", "[v]", "-map", "[a]")
-	append(&cmd, "-frames:v", hprintf("%d", s.out_frames))
-	append(&cmd, ..vcodec)
-	append(&cmd, "-r", hprintf("%d", FPS), "-c:a", "pcm_s16le", p.out)
+	for i in 0 ..< len(slides) {
+		strings.write_string(&b, hprintf("[a%d]", i))
+	}
+	strings.write_string(&b, hprintf("concat=n=%d:v=0:a=1[ac];[ac]volume=%.1fdB,alimiter=limit=0.89:level=false,aformat=channel_layouts=mono[a]",
+		len(slides), gain_db))
+	append(&cmd, "-filter_complex", strings.to_string(b))
+	append(&cmd, "-map", "[a]", "-c:a", "aac", "-aac_coder", "fast", "-b:a", "160k", out)
 	return cmd[:]
 }
 
-concat_cmd :: proc(list_path, out: string) -> []string {
+// mux_cmd concatenates the video segments (stream copy) with the finished AAC
+// track and writes a faststart MP4.
+mux_cmd :: proc(seg_list, audio, out: string) -> []string {
 	return cmd_of(
-		"ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "concat", "-safe", "0",
-		"-i", list_path, "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
-		"-movflags", "+faststart", out,
+		"ffmpeg", "-nostdin", "-y", "-v", "error",
+		"-f", "concat", "-safe", "0", "-i", seg_list,
+		"-i", audio, "-map", "0:v", "-map", "1:a",
+		"-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", out,
 	)
 }
 
 duration_cmd :: proc(path: string) -> []string {
 	return cmd_of("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path)
-}
-
-vaapi_test_cmd :: proc(device: string) -> []string {
-	return cmd_of(
-		"ffmpeg", "-nostdin", "-v", "error", "-vaapi_device", device,
-		"-f", "lavfi", "-i", "color=black:s=256x256:r=30", "-frames:v", "1",
-		"-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-f", "null", "-",
-	)
 }

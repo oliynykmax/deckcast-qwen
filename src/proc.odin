@@ -149,6 +149,43 @@ must_batch :: proc(jobs: []Job, max_parallel: int) {
 	}
 }
 
+// job_start_bg spawns one job in the background (logs to files) and returns its
+// process handle. Call from the main thread only (os.process_start is not
+// thread-safe). The caller waits with job_wait_bg.
+job_start_bg :: proc(j: ^Job) -> (p: os.Process, ok: bool) {
+	out, oerr := os.open(j.stdout_path, {.Write, .Create, .Trunc})
+	errf, eerr := os.open(j.stderr_path, {.Write, .Create, .Trunc})
+	if oerr != nil || eerr != nil {
+		fmt.eprintf("deckcast: cannot open logs for %s\n", j.label)
+		return
+	}
+	desc := os.Process_Desc{command = j.cmd, stdout = out, stderr = errf}
+	child, perr := os.process_start(desc)
+	os.close(out)
+	os.close(errf)
+	if perr != nil {
+		fmt.eprintf("deckcast: cannot start %s: %v\n", j.label, perr)
+		return
+	}
+	return child, true
+}
+
+// job_wait_bg blocks until a background job exits and records its result.
+job_wait_bg :: proc(p: os.Process, j: ^Job) {
+	state, err := os.process_wait(p)
+	if err != nil || !state.exited {
+		j.ok = false
+		j.exit_code = -1
+		return
+	}
+	j.exit_code = state.exit_code
+	j.ok = state.exit_code == 0
+	if !j.ok {
+		fmt.eprintf("deckcast: %s failed (exit %d)\n", j.label, state.exit_code)
+		fmt.eprintf("%s\n", tail_of_file(j.stderr_path))
+	}
+}
+
 read_log :: proc(path: string) -> string {
 	data, err := os.read_entire_file(path, context.allocator)
 	if err != nil {

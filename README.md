@@ -45,14 +45,14 @@ Options:
 | `--target F` | auto-gain target LUFS (default `-18`) |
 | `--work DIR` | work directory, kept for inspection (default `/tmp/deckcast-<pid>`) |
 | `--slides LO-HI` | compile only a slide range (quick tests) |
-| `--encoder E` | `auto` (default), `vaapi`, or `x264` |
-| `--jobs N` | parallel encode jobs (default 3 for VAAPI, 4 for x264) |
-| `--vaapi-device P` | DRM render node (default: first `/dev/dri/renderD*`) |
+| `--fps N` | output frame rate (default `30`, the source rate — every webcam frame is kept) |
+| `--jobs N` | parallel x264 strip encoders (default `2`) |
+| `--cpu-decode` | force CPU webcam decode (GPU/VAAPI decode is auto-used when available) |
 | `--check` | also measure the finished file's loudness |
 
 Runtime dependencies: `ffmpeg`/`ffprobe`, `soffice` (LibreOffice), `pdftoppm`
-(poppler). VAAPI encoding additionally needs a DRM render node and a GPU with
-an H.264 encode engine; without one, `auto` falls back to libx264.
+(poppler), and the `x264` CLI. VAAPI webcam decode additionally needs a DRM
+render node; without one it falls back to CPU decode automatically.
 
 ## How it works
 
@@ -74,31 +74,41 @@ Odin owns everything except the pixel pushing:
    page ranges.
 4. **Mask** (`src/mask.odin`) — the circle mask is generated directly as raw
    gray bytes with 4×4 supersampling (no ImageMagick).
-5. **Encoding** (`src/media.odin`) — one ffmpeg per slide. Each slide PNG is
-   converted to raw YUV **once**; the segment graph uploads it to the GPU
-   once and loops the hardware surface, so per-frame CPU work is only webcam
-   decode + crop/scale/alphamerge of the small circle. `overlay_vaapi`
-   composites on the GPU and `h264_vaapi` encodes (`-bf 0`, which is ~40%
-   faster on AMD VCN). Audio gets `atempo` (speed), gain, `alimiter`,
-   `apad`/`atrim` to the exact segment length, mono 48 kHz. Segments are
-   concatenated with stream copy and AAC 160k.
+5. **Composite + encode** (`src/composite.odin`, `src/encode.odin`,
+   `src/h264.odin`) — the slide background is static; only the small webcam
+   circle moves. Each slide PNG is converted to raw YUV once. Odin blends the
+   circle-masked webcam onto a **horizontal strip** (the macroblock rows that
+   contain the webcam, e.g. 1920×360) and writes only that strip — not the full
+   1080p frame. `x264` encodes the strip (CAVLC, `--stitchable`), and
+   `src/h264.odin` splices it into a full 1080p H.264 stream at the bitstream
+   level: the static rows above the strip become P-skips, so **only the pixels
+   that change are actually coded**. The output stays at the source rate
+   (30 fps, every webcam frame preserved). Webcam decode, compositing and
+   encoding run as an out-of-order pipeline (ready slides are processed while
+   long clips still decode); the audio pass renders concurrently and is hidden
+   inside the encode. Segments are wrapped and concatenated with stream copy
+   plus AAC 160k.
 
 ## Performance
 
-On the test deck (21 slides, ~16 min, 28,900 source frames, 1080p30) on a
-Ryzen 7 8845HS / Radeon 780M: **~53 s total**, of which ~42 s is GPU encoding
-(~660 fps aggregate — the VCN engine's measured ceiling for 1080p H.264).
-The 10 s stretch goal is not reachable on this hardware: encoding alone needs
-28,900 / 660 ≈ 44 s. See `REPORT.md` for the full stage breakdown and the
-measurements behind these numbers.
+On the test deck (21 slides, ~16 min, 28,891 source frames, 1080p30) on a
+Ryzen 7 8845HS / Radeon 780M: **~21 s total at the full 30 fps** (every webcam
+frame preserved), down from ~53 s for the earlier full-frame GPU-encode
+pipeline. The win comes from encoding only the pixels that change: the static
+slide background is carried by P-skips and only the webcam strip is coded, so
+the encoder reads/writes ~6× less pixel data. See `REPORT.md` for the stage
+breakdown, the bitstream-splice design and the verification.
 
 ## Layout
 
 ```
-src/main.odin    CLI, orchestration, stage timing
-src/zip.odin     zip reader (stored+deflate) / stored writer
-src/deck.odin    slide XML parsing and cleaning
-src/mask.odin    supersampled ellipse mask
-src/proc.odin    process scheduler, heap printf, command helpers
-src/media.odin   ffmpeg/ffprobe/LibreOffice command builders
+src/main.odin      CLI, orchestration, stage timing
+src/zip.odin       zip reader (stored+deflate) / stored writer
+src/deck.odin      slide XML parsing and cleaning
+src/mask.odin      supersampled ellipse mask
+src/proc.odin      process scheduler, heap printf, command helpers
+src/media.odin     ffmpeg/ffprobe/LibreOffice/x264 command builders
+src/composite.odin static-background strip compositing (YUV alpha blit)
+src/encode.odin    out-of-order decode/composite/encode pipeline
+src/h264.odin      H.264 bitstream splice (strip -> full 1080p, P-skips)
 ```

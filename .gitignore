@@ -3,3 +3,4 @@ deckcast
 *.o
 *.ll
 *.bct2
+opencode.json
