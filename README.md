@@ -86,8 +86,8 @@ Odin owns everything except the pixel pushing:
    (30 fps, every webcam frame preserved). Webcam decode, compositing and
    encoding run as an out-of-order pipeline (ready slides are processed while
    long clips still decode); the audio pass renders concurrently and is hidden
-   inside the encode. Segments are wrapped and concatenated with stream copy
-   plus AAC 160k.
+   inside the encode. The stitchable H.264 segments are byte-concatenated and
+   muxed with the AAC track (stream copy, faststart).
 
 ## Performance
 

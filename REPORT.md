@@ -52,24 +52,24 @@ compositing/encoding); `--cpu-decode` forces software.
 Machine: AMD Ryzen 7 8845HS (8c/16t), Radeon 780M (VAAPI), 27 GB RAM,
 ffmpeg 9.0.2, x264 0.165, LibreOffice 26.8.1.1, poppler 26.10.
 
-**Default run, speed 1.0, 30 fps: ~21.7 s** (down from ~53 s for the earlier
-full-frame GPU-encode pipeline).
+**Default run, speed 1.0, 30 fps: ~20.6 s** (down from ~53 s for the earlier
+full-frame GPU-encode pipeline — a ~2.6× speedup).
 
 | stage | time |
 |---|---|
-| parse (zip + slide XML) | 0.08 s |
-| extract webcam clips | 0.14 s |
+| parse (zip + slide XML) | 0.12 s |
+| extract webcam clips | 0.17 s |
 | clean deck re-zip | 0.04 s |
-| probe (21 parallel ffprobes) | 0.26 s |
-| render (LibreOffice PDF, overlaps probe/decode) | 1.09 s |
-| rasterize (pdftoppm, parallel) | 0.67 s |
+| probe (21 parallel ffprobes) | 0.27 s |
+| render (LibreOffice PDF, overlaps probe/decode) | 1.17 s |
+| rasterize (pdftoppm, parallel) | 0.68 s |
 | PNG → raw YUV | 0.43 s |
 | masks | <0.01 s |
-| encode (decode + composite + strip encode + splice, pipelined) | 16.52 s |
+| encode (decode + composite + strip encode + splice, pipelined) | 16.97 s |
 | audio (hidden inside encode) | 0.00 s |
-| wrap segments → MKV | 1.36 s |
-| mux (concat copy + faststart) | 1.04 s |
-| **total** | **21.65 s** |
+| concat stitchable H.264 segments (byte copy) | 0.13 s |
+| mux (raw H.264 + AAC, faststart) | 0.54 s |
+| **total** | **20.56 s** |
 
 Inside the encode stage: webcam decode finishes at ~12 s (VAAPI, GPU-bound);
 composite ~19 s of worker-time across 4 workers; the strip encoders run at
@@ -121,7 +121,7 @@ All outputs under `out/` (gitignored). Inputs in `~/Downloads` were only read.
 
 ## Unfinished / limitations
 
-- **The <15 s stretch goal is not yet met (~21.7 s).** The remaining floor is
+- **The <15 s stretch goal is not yet met (~20.6 s).** The remaining floor is
   the webcam decode (~12 s, GPU-bound) plus memory-bandwidth contention between
   compositing and x264 on the full-width strip. A narrower strip (webcam
   columns only, per-row slices) would cut the composite/encode pixel traffic
@@ -134,11 +134,11 @@ All outputs under `out/` (gitignored). Inputs in `~/Downloads` were only read.
 
 ## Final summary
 
-- **Full-deck compile: ~21.7 s at the mandatory 30 fps** (28,891 frames),
-  vs ~53 s previously — a 2.4× speedup achieved by encoding only the pixels
+- **Full-deck compile: ~20.6 s at the mandatory 30 fps** (28,891 frames),
+  vs ~53 s previously — a ~2.6× speedup achieved by encoding only the pixels
   that change (static background → P-skips; only the webcam strip is coded).
-- Per-stage: encode 16.5 s (decode ~12 s GPU + composite/strip-encode/splice
-  pipelined), wrap 1.4 s, mux 1.0 s, render/rasterize/YUV ~2.2 s, rest <0.6 s.
+- Per-stage: encode ~17 s (decode ~12 s GPU + composite/strip-encode/splice
+  pipelined), concat 0.13 s, mux 0.54 s, render/rasterize/YUV ~2.3 s, rest <0.6 s.
 - **Verified:** exact frame count (28,891) and duration (963.03 s); full decode
   with zero errors; audio in sync (corr 0.952, ~76 ms codec delay) at −18.0
   LUFS; frames inspected at several timestamps including slide boundaries —
