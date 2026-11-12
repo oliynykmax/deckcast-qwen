@@ -59,6 +59,7 @@ ST_COMPOSING :: 1
 ST_READY :: 2
 ST_ENCODING :: 3
 ST_DONE :: 4
+ST_SPLICING :: 5
 
 // cam states
 CAM_PENDING :: 0
@@ -144,6 +145,57 @@ Pipe_Shared :: struct {
 	is_last:    []bool, // chunk is the last of its slide
 	comp_done:  []int,  // per-slide count of chunks finished compositing
 	nchunks:    []int,  // per-slide total chunk count
+	splice_q:   [dynamic]int, // chunks whose encode finished, awaiting splice
+	splice_qh:  int,  // read head into splice_q
+	splice_done: bool, // all encodes reaped; splice worker may exit when queue empty
+	spliced:    int,  // count of chunks spliced
+	splice_exited: bool,
+	t0:         time.Time,
+}
+
+// splice_worker drains finished encodes and splices them off the main thread,
+// so the scheduler is never blocked by bitstream work.
+splice_worker :: proc(data: rawptr) {
+	sh := (^Pipe_Shared)(data)
+	defer {
+		sync.mutex_lock(&sh.mu)
+		sh.splice_exited = true
+		sync.mutex_unlock(&sh.mu)
+	}
+	for {
+		sync.mutex_lock(&sh.mu)
+		if sh.splice_qh >= len(sh.splice_q) {
+			done := sh.splice_done
+			failed := sh.failed
+			sync.mutex_unlock(&sh.mu)
+			if done || failed {
+				return
+			}
+			time.sleep(1 * time.Millisecond)
+			continue
+		}
+		ci := sh.splice_q[sh.splice_qh]
+		sh.splice_qh += 1
+		sync.mutex_unlock(&sh.mu)
+
+		c := &sh.chunks[ci]
+		s := &sh.slides[c.slide_idx]
+		skip := (s.y/16 - 1) * (BG_W / 16)
+		strip264 := hprintf("%s/seg/strip_%04d.264", sh.work, c.id)
+		bgtop264 := hprintf("%s/seg/bgtop_%02d.264", sh.work, s.number)
+		out264 := hprintf("%s/seg/%04d.264", sh.work, c.id)
+		ok := splice_chunk(strip264, bgtop264, out264, skip)
+		os.remove(strip264)
+		os.remove(hprintf("%s/strip_%04d.yuv", sh.shm, c.id))
+		sync.mutex_lock(&sh.mu)
+		if !ok {
+			sh.failed = true
+		}
+		sh.inflight -= 1
+		sh.state[ci] = ST_DONE
+		sh.spliced += 1
+		sync.mutex_unlock(&sh.mu)
+	}
 }
 
 composite_worker :: proc(data: rawptr) {
@@ -240,6 +292,7 @@ encode_pipeline :: proc(slides: []Slide, chunks: []Chunk, work: string, shm: str
 		cam_jarr = cam_jarr, is_last = is_last,
 		comp_done = comp_done, nchunks = nchunks,
 		cam_next = CAM_PAR, cam_running = CAM_PAR, // first CAM_PAR pre-started by caller
+		t0 = time.now(),
 	}
 	if CAM_PAR > ns {
 		sh.cam_next = ns
@@ -250,7 +303,15 @@ encode_pipeline :: proc(slides: []Slide, chunks: []Chunk, work: string, shm: str
 		delete(is_last)
 		delete(nchunks)
 		delete(comp_done)
+		delete(sh.splice_q)
 	}
+
+	// Start the composite/splice workers first so they run while the main
+	// thread prepares the bg_top I-slice sources below.
+	for w in 0 ..< COMP_WORKERS {
+		thread.run_with_data(&sh, composite_worker, context)
+	}
+	thread.run_with_data(&sh, splice_worker, context)
 
 	// Static bg_top I-slice source per slide: extract the rows above the strip
 	// and encode once (1 frame each). SPS/PPS match the strip encodes (--stitchable).
@@ -274,10 +335,6 @@ encode_pipeline :: proc(slides: []Slide, chunks: []Chunk, work: string, shm: str
 		}
 	}
 
-	for w in 0 ..< COMP_WORKERS {
-		thread.run_with_data(&sh, composite_worker, context)
-	}
-
 	procs := make([]os.Process, n)
 	jarr := make([]Job, n)
 	full_paths := make([]string, n)
@@ -291,7 +348,6 @@ encode_pipeline :: proc(slides: []Slide, chunks: []Chunk, work: string, shm: str
 	encoded := 0
 	all_ok := true
 	pipe_start := time.now()
-	splice_dur := time.Duration(0)
 	cam_done_logged := false
 
 	for encoded < n {
@@ -389,26 +445,18 @@ encode_pipeline :: proc(slides: []Slide, chunks: []Chunk, work: string, shm: str
 				all_ok = false
 				fmt.eprintf("deckcast: %s failed (exit %d)\n", jarr[ci].label, state.exit_code)
 				fmt.eprintf("%s\n", tail_of_file(jarr[ci].stderr_path))
+				os.remove(full_paths[ci])
+				sync.mutex_lock(&sh.mu)
+				sh.inflight -= 1
+				sh.state[ci] = ST_DONE
+				sync.mutex_unlock(&sh.mu)
 			} else {
-				// Splice the strip into a full 1080p segment (static rows -> skips).
-				c := &chunks[ci]
-				s := &slides[c.slide_idx]
-				skip := (s.y/16 - 1) * (BG_W / 16)
-				strip264 := hprintf("%s/seg/strip_%04d.264", work, c.id)
-				bgtop264 := hprintf("%s/seg/bgtop_%02d.264", work, s.number)
-				out264 := hprintf("%s/seg/%04d.264", work, c.id)
-				st := time.now()
-				if !splice_chunk(strip264, bgtop264, out264, skip) {
-					all_ok = false
-				}
-				splice_dur += time.since(st)
-				os.remove(strip264)
+				// Hand off to the splice worker; keep scheduling unblocked.
+				sync.mutex_lock(&sh.mu)
+				sh.state[ci] = ST_SPLICING
+				append(&sh.splice_q, ci)
+				sync.mutex_unlock(&sh.mu)
 			}
-			os.remove(full_paths[ci])
-			sync.mutex_lock(&sh.mu)
-			sh.inflight -= 1
-			sh.state[ci] = ST_DONE
-			sync.mutex_unlock(&sh.mu)
 		}
 
 		if encoded < n {
@@ -416,8 +464,24 @@ encode_pipeline :: proc(slides: []Slide, chunks: []Chunk, work: string, shm: str
 		}
 	}
 
+	// All encodes reaped; let the splice worker finish the queue.
+	sync.mutex_lock(&sh.mu)
+	sh.splice_done = true
+	sync.mutex_unlock(&sh.mu)
+	for {
+		sync.mutex_lock(&sh.mu)
+		exited := sh.splice_exited
+		sync.mutex_unlock(&sh.mu)
+		if exited {
+			break
+		}
+		time.sleep(1 * time.Millisecond)
+	}
+	if sh.failed || sh.spliced < n {
+		all_ok = false
+	}
+
 	fmt.eprintf("[profile] composite total: %.2f s across %d workers (%d chunks)\n",
 		time.duration_seconds(sh.comp_dur), COMP_WORKERS, n)
-	fmt.eprintf("[profile] splice total: %.2f s (main thread)\n", time.duration_seconds(splice_dur))
 	return all_ok
 }
