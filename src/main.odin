@@ -455,33 +455,38 @@ main :: proc() {
 	gain_db := ac.gain_db
 	stage_record(&stages, "audio", t)
 
-	// --- wrap raw H.264 segments into Matroska (parallel, stream copy) ---
+	// --- concatenate the stitchable H.264 segments (byte copy) ---
 	t = time.now()
-	wrap_jobs: [dynamic]Job
-	for &c in chunks {
-		in264 := hprintf("%s/seg/%04d.264", o.work, c.id)
-		outmkv := hprintf("%s/seg/%04d.mkv", o.work, c.id)
-		append(&wrap_jobs, job_make(hprintf("wrap-%04d", c.id), o.work, wrap_cmd(in264, outmkv, o.fps)))
-	}
-	must_batch(wrap_jobs[:], 8)
-	for &c in chunks {
-		os.remove(hprintf("%s/seg/%04d.264", o.work, c.id))
+	combined := hprintf("%s/combined.264", o.work)
+	{
+		of, oerr := os.open(combined, {.Write, .Create, .Trunc})
+		if oerr != nil {
+			fmt.eprintf("deckcast: cannot create %s: %v\n", combined, oerr)
+			os.exit(1)
+		}
+		for &c in chunks {
+			p := hprintf("%s/seg/%04d.264", o.work, c.id)
+			data, rerr := os.read_entire_file(p, context.allocator)
+			if rerr != nil {
+				fmt.eprintf("deckcast: cannot read %s: %v\n", p, rerr)
+				os.exit(1)
+			}
+			if _, werr := os.write(of, data); werr != nil {
+				fmt.eprintf("deckcast: concat write failed: %v\n", werr)
+				os.exit(1)
+			}
+			delete(data)
+			os.remove(p)
+		}
+		os.close(of)
 	}
 	stage_record(&stages, "wrap", t)
 
-	// --- concatenate + faststart (audio already finished) ---
+	// --- mux + faststart (audio already finished) ---
 	t = time.now()
-	seg_list := hprintf("%s/segments.txt", o.work)
-	{
-		b := strings.builder_make()
-		for &c in chunks {
-			strings.write_string(&b, hprintf("file '%s/seg/%04d.mkv'\n", o.work, c.id))
-		}
-		write_text(seg_list, strings.to_string(b))
-	}
 	out_abs := abs_path(o.output)
 	os.make_directory_all(os.dir(out_abs))
-	must_batch([]Job{job_make("mux", o.work, mux_cmd(seg_list, audio_out, out_abs))}, 1)
+	must_batch([]Job{job_make("mux", o.work, mux_cmd(combined, audio_out, out_abs, o.fps))}, 1)
 	stage_record(&stages, "mux", t)
 
 	// --- PDF deliverable ---

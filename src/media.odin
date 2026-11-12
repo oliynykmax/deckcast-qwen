@@ -185,15 +185,6 @@ write_bgtop :: proc(yuv_path, out_path: string, bgtop_h: int) -> bool {
 	return os.write_entire_file(out_path, out[:]) == nil
 }
 
-// wrap_cmd wraps a raw H.264 segment into Matroska at the right frame rate so
-// the concat demuxer can stitch segments with correct timestamps.
-wrap_cmd :: proc(in_264, out_mkv: string, fps: int) -> []string {
-	return cmd_of(
-		"ffmpeg", "-nostdin", "-y", "-v", "error",
-		"-r", hprintf("%d", fps), "-i", in_264, "-c", "copy", out_mkv,
-	)
-}
-
 // audio_pass_cmd renders the whole narration in one pass: per-clip speed +
 // exact trim, concat, gain, limiter, 48 kHz mono AAC. Runs concurrently with
 // the video encode so its cost is hidden.
@@ -219,12 +210,12 @@ audio_pass_cmd :: proc(slides: []Slide, out: string, speed, gain_db: f64) -> []s
 	return cmd[:]
 }
 
-// mux_cmd concatenates the video segments (stream copy) with the finished AAC
-// track and writes a faststart MP4.
-mux_cmd :: proc(seg_list, audio, out: string) -> []string {
+// mux_cmd muxes the concatenated raw H.264 stream (stitchable segments) with
+// the finished AAC track and writes a faststart MP4 at the given frame rate.
+mux_cmd :: proc(video_264, audio, out: string, fps: int) -> []string {
 	return cmd_of(
 		"ffmpeg", "-nostdin", "-y", "-v", "error",
-		"-f", "concat", "-safe", "0", "-i", seg_list,
+		"-r", hprintf("%d", fps), "-i", video_264,
 		"-i", audio, "-map", "0:v", "-map", "1:a",
 		"-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", out,
 	)
